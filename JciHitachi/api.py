@@ -1025,7 +1025,22 @@ class JciHitachiAWSAPI:
                 )
 
             # status
-            self.refresh_status(refresh_support_code=True, refresh_shadow=True)
+            max_retries = 3
+            retry_delay = 2  # seconds
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    self.refresh_status(refresh_support_code=True, refresh_shadow=True)
+                    break
+                except RuntimeError as e:
+                    last_error = e
+                    if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                        time.sleep(retry_delay)
+            else:
+                raise RuntimeError(
+                    f"Failed to refresh device status after {max_retries} attempts. Last error: {str(last_error)}"
+                )
         else:
             raise RuntimeError(
                 f"An error occurred when retrieving devices info: {conn_status}"
