@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from random import random, choices
@@ -556,6 +557,11 @@ class JciHitachiAWSMqttConnection:
         self._mqtt_events: JciHitachiMqttEvents = JciHitachiMqttEvents()
         self._execution_lock: threading.Lock = threading.Lock()
         self._execution_pools: JciHitachiExecutionPools = JciHitachiExecutionPools()
+        
+        # Add connection state tracking
+        self._connection_state: str = "disconnected"  # disconnected, connecting, connected
+        self._last_connection_attempt: float = 0
+        self._reconnection_in_progress: bool = False
 
     def __del__(self):
         self.disconnect()
@@ -655,6 +661,63 @@ class JciHitachiAWSMqttConnection:
         _LOGGER.error(f"MQTT connection was interrupted with exception {error}")
         self._mqtt_events.mqtt_error = error.__class__.__name__
         self._mqtt_events.mqtt_error_event.set()
+        
+        # Add automatic reconnection with exponential backoff
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self, attempt: int = 1, max_attempts: int = 5):
+        """Schedule reconnection with exponential backoff."""
+        # Prevent multiple reconnection attempts
+        if self._reconnection_in_progress:
+            _LOGGER.debug("Reconnection already in progress, skipping")
+            return
+            
+        if attempt > max_attempts:
+            _LOGGER.error(f"Max reconnection attempts ({max_attempts}) reached. Giving up.")
+            self._reconnection_in_progress = False
+            return
+            
+        self._reconnection_in_progress = True
+        
+        # Exponential backoff: 2^attempt seconds, with jitter
+        delay = min(2 ** attempt + random(), 300)  # Cap at 5 minutes
+        _LOGGER.info(f"Scheduling reconnection attempt {attempt} in {delay:.1f} seconds")
+        
+        def reconnect():
+            try:
+                time.sleep(delay)
+                _LOGGER.info(f"Attempting reconnection (attempt {attempt})")
+                
+                # Check if credentials need refresh before reconnecting
+                self._refresh_credentials_if_needed()
+                
+                # Try to reconnect
+                self._connection_state = "connecting"
+                connect_future = self._mqttc.connect()
+                connect_future.result(timeout=30)  # 30 second timeout
+                self._connection_state = "connected"
+                _LOGGER.info("MQTT reconnection successful")
+                self._reconnection_in_progress = False
+                
+            except Exception as e:
+                _LOGGER.error(f"Reconnection attempt {attempt} failed: {e}")
+                self._connection_state = "disconnected"
+                # Schedule next attempt
+                self._reconnection_in_progress = False
+                self._schedule_reconnect(attempt + 1, max_attempts)
+        
+        # Run reconnection in a separate thread to avoid blocking
+        threading.Thread(target=reconnect, daemon=True).start()
+
+    def _refresh_credentials_if_needed(self):
+        """Check if credentials need to be refreshed and refresh them if necessary."""
+        try:
+            # This will trigger credential refresh if needed
+            credentials = self._get_credentials_callable()
+            if credentials:
+                _LOGGER.debug("Credentials refreshed successfully")
+        except Exception as e:
+            _LOGGER.warning(f"Failed to refresh credentials: {e}")
 
     def _on_connection_resumed(
         self, connection, return_code, session_present, **kwargs
@@ -673,11 +736,11 @@ class JciHitachiAWSMqttConnection:
                     assert resubscribe_results["packet_id"] == packet_id
                     for topic, qos in resubscribe_results["topics"]:
                         assert qos is not None
+                    _LOGGER.info("Resubscribed successfully.")
                 except Exception as e:
                     _LOGGER.error("Resubscribe failure:", e)
 
             resubscribe_future.add_done_callback(on_resubscribe_complete)
-            _LOGGER.info("Resubscribed successfully.")
         return
 
     async def _wrap_async(self, identifier: str, fn: Callable) -> str:
@@ -691,7 +754,14 @@ class JciHitachiAWSMqttConnection:
         """Disconnect from the MQTT broker."""
 
         if self._mqttc is not None:
-            self._mqttc.disconnect()
+            try:
+                self._connection_state = "disconnected"
+                self._reconnection_in_progress = False
+                self._mqttc.disconnect()
+                _LOGGER.info("MQTT disconnected successfully")
+            except Exception as e:
+                _LOGGER.error(f"Error during MQTT disconnect: {e}")
+                self._connection_state = "disconnected"
 
     def configure(self, identity_id) -> None:
         """Configure MQTT.
@@ -708,17 +778,66 @@ class JciHitachiAWSMqttConnection:
         event_loop_group = awscrt.io.EventLoopGroup(1)
         host_resolver = awscrt.io.DefaultHostResolver(event_loop_group)
         client_bootstrap = awscrt.io.ClientBootstrap(event_loop_group, host_resolver)
+        
+        # Generate a more unique client ID to avoid conflicts
+        unique_suffix = str(uuid.uuid4()).replace('-', '')[:16]
+        client_id = f"{identity_id}_{unique_suffix}"
+        
         self._mqttc = mqtt_connection_builder.websockets_with_default_aws_signing(
             AWS_REGION,
             cred_provider,
             client_bootstrap=client_bootstrap,
             endpoint=AWS_MQTT_ENDPOINT,
-            client_id=f"{identity_id}_{''.join(choices('abcdef0123456789', k=16))}",  # {identityid}_{64bit_hex}
+            client_id=client_id,
+            # Add keepalive settings to prevent unexpected hangups
+            keep_alive_secs=30,  # Send ping every 30 seconds
+            ping_timeout_ms=5000,  # 5 second timeout for ping response
+            # Add connection timeout
+            socket_options=awscrt.io.SocketOptions(
+                type=awscrt.io.SocketType.STREAM,
+                domain=awscrt.io.SocketDomain.IPV4,
+                connect_timeout_ms=60000,  # 60 second connection timeout
+                keep_alive=True,
+                keep_alive_interval_secs=1,
+                keep_alive_timeout_secs=3,
+                keep_alive_max_failed_probes=3,
+            ),
+            # Set clean session to False to maintain subscriptions across reconnects
+            clean_session=False,
             on_connection_interrupted=self._on_connection_interrupted,
             on_connection_resumed=self._on_connection_resumed,
         )
         self._mqttc.on_message(self._on_message)
         self._shadow_mqttc = iotshadow.IotShadowClient(self._mqttc)
+
+    def is_connection_healthy(self) -> bool:
+        """Check if the MQTT connection is healthy.
+        
+        Returns
+        -------
+        bool
+            True if connection is healthy, False otherwise.
+        """
+        if self._mqttc is None:
+            return False
+            
+        # Check connection state
+        if self._connection_state != "connected":
+            return False
+            
+        # Additional health checks could be added here
+        # such as checking last successful ping time
+        return True
+
+    def get_connection_state(self) -> str:
+        """Get current connection state.
+        
+        Returns
+        -------
+        str
+            Current connection state: 'disconnected', 'connecting', or 'connected'.
+        """
+        return self._connection_state
 
     def connect(
         self,
@@ -743,11 +862,27 @@ class JciHitachiAWSMqttConnection:
             A bool indicating whether the mqtt is successfully connected and subscribed.
         """
 
+        # Prevent multiple simultaneous connection attempts
+        if self._connection_state == "connecting":
+            _LOGGER.warning("Connection attempt already in progress")
+            return False
+            
+        # Rate limiting: don't attempt connection too frequently
+        current_time = time.time()
+        if current_time - self._last_connection_attempt < 5:  # 5 second cooldown
+            _LOGGER.warning("Connection attempt rate limited")
+            return False
+            
+        self._last_connection_attempt = current_time
+        self._connection_state = "connecting"
+
         try:
             connect_future = self._mqttc.connect()
-            connect_future.result()
+            connect_future.result(timeout=30)  # 30 second timeout instead of indefinite wait
+            self._connection_state = "connected"
             _LOGGER.info("MQTT Connected.")
         except Exception as e:
+            self._connection_state = "disconnected"
             self._mqtt_events.mqtt_error = e.__class__.__name__
             self._mqtt_events.mqtt_error_event.set()
             _LOGGER.error("MQTT connection failed with exception {}".format(e))
@@ -757,7 +892,7 @@ class JciHitachiAWSMqttConnection:
             subscribe_future, _ = self._mqttc.subscribe(
                 f"{host_identity_id}/+/+/response", QOS, callback=self._on_publish
             )
-            subscribe_future.result()
+            subscribe_future.result(timeout=15)  # Add timeout for subscription
 
             if thing_names is not None and shadow_names is not None:
                 shadow_names = (
@@ -791,9 +926,9 @@ class JciHitachiAWSMqttConnection:
                             callback=self._on_update_named_shadow_rejected,
                         )
 
-                        # Wait for subscriptions to succeed
-                        update_accepted_subscribed_future.result()
-                        update_rejected_subscribed_future.result()
+                        # Wait for subscriptions to succeed with timeout
+                        update_accepted_subscribed_future.result(timeout=10)
+                        update_rejected_subscribed_future.result(timeout=10)
 
                         (
                             get_accepted_subscribed_future,
@@ -817,11 +952,12 @@ class JciHitachiAWSMqttConnection:
                             callback=self._on_get_named_shadow_rejected,
                         )
 
-                        # Wait for subscriptions to succeed
-                        get_accepted_subscribed_future.result()
-                        get_rejected_subscribed_future.result()
+                        # Wait for subscriptions to succeed with timeout
+                        get_accepted_subscribed_future.result(timeout=10)
+                        get_rejected_subscribed_future.result(timeout=10)
 
         except Exception as e:
+            self._connection_state = "disconnected"
             self._mqtt_events.mqtt_error = e.__class__.__name__
             self._mqtt_events.mqtt_error_event.set()
             self.disconnect()
