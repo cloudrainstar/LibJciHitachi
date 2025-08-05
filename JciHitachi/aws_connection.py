@@ -794,8 +794,8 @@ class JciHitachiAWSMqttConnection:
             ping_timeout_ms=5000,  # 5 second timeout for ping response
             # Add connection timeout
             socket_options=awscrt.io.SocketOptions(
-                type=awscrt.io.SocketType.STREAM,
-                domain=awscrt.io.SocketDomain.IPV4,
+                type=awscrt.io.SocketType.Stream,
+                domain=awscrt.io.SocketDomain.IPv4,
                 connect_timeout_ms=60000,  # 60 second connection timeout
                 keep_alive=True,
                 keep_alive_interval_secs=1,
