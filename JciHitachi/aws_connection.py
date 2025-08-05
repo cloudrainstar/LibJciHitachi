@@ -719,6 +719,18 @@ class JciHitachiAWSMqttConnection:
         except Exception as e:
             _LOGGER.warning(f"Failed to refresh credentials: {e}")
 
+    def _create_socket_options(self):
+        """Create socket options with proper configuration for MQTT connection."""
+        socket_options = awscrt.io.SocketOptions()
+        socket_options.type = awscrt.io.SocketType.Stream
+        socket_options.domain = awscrt.io.SocketDomain.IPv4
+        socket_options.connect_timeout_ms = 60000  # 60 second connection timeout
+        socket_options.keep_alive = True
+        socket_options.keep_alive_interval_secs = 1
+        socket_options.keep_alive_timeout_secs = 3
+        socket_options.keep_alive_max_probes = 3
+        return socket_options
+
     def _on_connection_resumed(
         self, connection, return_code, session_present, **kwargs
     ):
@@ -792,16 +804,8 @@ class JciHitachiAWSMqttConnection:
             # Add keepalive settings to prevent unexpected hangups
             keep_alive_secs=30,  # Send ping every 30 seconds
             ping_timeout_ms=5000,  # 5 second timeout for ping response
-            # Add connection timeout
-            socket_options=awscrt.io.SocketOptions(
-                type=awscrt.io.SocketType.Stream,
-                domain=awscrt.io.SocketDomain.IPv4,
-                connect_timeout_ms=60000,  # 60 second connection timeout
-                keep_alive=True,
-                keep_alive_interval_secs=1,
-                keep_alive_timeout_secs=3,
-                keep_alive_max_failed_probes=3,
-            ),
+            # Add connection timeout and socket options
+            socket_options=self._create_socket_options(),
             # Set clean session to False to maintain subscriptions across reconnects
             clean_session=False,
             on_connection_interrupted=self._on_connection_interrupted,
